@@ -117,6 +117,13 @@ type bodyFirstFactorRequest struct {
 	// TODO(c.michaud): add required validation once the above PR is merged.
 }
 
+type bodyFirstFactorSPNEGOequest struct {
+	Workflow      string `json:"workflow"`
+	WorkflowID    string `json:"workflowID"`
+	TargetURL     string `json:"targetURL"`
+	RequestMethod string `json:"requestMethod"`
+}
+
 // bodyFirstFactorRequest represents the JSON body received by the endpoint.
 type bodySecondFactorPasswordRequest struct {
 	Password   string `json:"password" valid:"required"`
