@@ -2,17 +2,18 @@ package handlers
 
 import (
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"strings"
 
+	"github.com/authelia/authelia/v4/internal/authentication"
 	"github.com/authelia/authelia/v4/internal/middlewares"
+	"github.com/authelia/authelia/v4/internal/regulation"
+	"github.com/authelia/authelia/v4/internal/session"
 	"github.com/valyala/fasthttp"
 	"gopkg.in/jcmturner/goidentity.v3"
 	"gopkg.in/jcmturner/gokrb5.v7/gssapi"
-	"gopkg.in/jcmturner/gokrb5.v7/keytab"
-	"gopkg.in/jcmturner/gokrb5.v7/service"
 	"gopkg.in/jcmturner/gokrb5.v7/spnego"
-	"gopkg.in/jcmturner/gokrb5.v7/types"
 )
 
 const (
@@ -25,64 +26,178 @@ const (
 )
 
 // spnego.SPNEGOKRB5Authenticate is a Kerberos spnego.SPNEGO authentication HTTP handler wrapper.
-func FirstFactorSPNEGO(inner fasthttp.RequestHandler, kt *keytab.Keytab, settings ...func(*service.Settings)) middlewares.RequestHandler {
+func FirstFactorSPNEGO(inner fasthttp.RequestHandler) middlewares.RequestHandler {
 	return func(ctx *middlewares.AutheliaCtx) {
-		// Get the auth header
-		s := strings.SplitN(string(ctx.Request.Header.Peek(spnego.HTTPHeaderAuthRequest)), " ", 2)
-		if len(s) != 2 || s[0] != spnego.HTTPHeaderAuthResponseValueKey {
+		var (
+			details *authentication.UserDetails
+			err     error
+		)
+
+		// getting the spnego headers
+		headerParts := strings.SplitN(string(ctx.Request.Header.Peek(spnego.HTTPHeaderAuthRequest)), " ", 2)
+		if len(headerParts) != 2 || headerParts[0] != spnego.HTTPHeaderAuthResponseValueKey {
 			// No Authorization header set so return 401 with WWW-Authenticate Negotiate header
 			ctx.Response.Header.Set(spnego.HTTPHeaderAuthResponse, spnego.HTTPHeaderAuthResponseValueKey)
-			ctx.Response.SetStatusCode(http.StatusUnauthorized)
-			ctx.Response.SetBodyString(spnego.UnauthorizedMsg)
+			ctx.SetStatusCode(fasthttp.StatusBadRequest)
+			ctx.SetJSONError(messageMFAValidationFailed)
+
+			ctx.Logger.WithError(err).Errorf(logFmtErrPasskeyAuthenticationChallengeValidate, errStrReqBodyParse)
+
+			doMarkAuthenticationAttempt(ctx, false, regulation.NewBan(regulation.BanTypeNone, "", nil), regulation.AuthTypePasskey, nil)
+
 			return
 		}
 
-		// Set up the spnego.SPNEGO GSS-API mechanism
-		var SPNEGO *spnego.SPNEGO
-		h, err := types.GetHostAddress(ctx.RemoteAddr().String())
-		if err == nil {
-			// put in this order so that if the user provides a ClientAddress it will override the one here.
-			o := append([]func(*service.Settings){service.ClientAddress(h)}, settings...)
-			SPNEGO = spnego.SPNEGOService(kt, o...)
-		} else {
-			SPNEGO = spnego.SPNEGOService(kt, settings...)
-			SPNEGO.Log("%s - spnego.SPNEGO could not parse client address: %v", ctx.RemoteAddr(), err)
+		bodyJSON := bodyFirstFactorSPNEGOequest{}
+		if err = ctx.ParseBody(&bodyJSON); err != nil {
+			ctx.Logger.WithError(err).Errorf(logFmtErrParseRequestBody, regulation.AuthType1FA)
+
+			respondUnauthorized(ctx, messageAuthenticationFailed)
+
+			return
 		}
 
-		// Decode the header into an spnego.SPNEGO context token
-		b, err := base64.StdEncoding.DecodeString(s[1])
+		// we then decode the base64-encoded token
+		b, err := base64.StdEncoding.DecodeString(headerParts[1])
 		if err != nil {
-			SPNEGONegotiateKRB5MechType(SPNEGO, ctx, "%s - spnego.SPNEGO error in base64 decoding negotiation header: %v", ctx.RemoteAddr(), err)
+			ctx.SetStatusCode(fasthttp.StatusBadRequest)
+			ctx.Logger.WithError(err).Errorf(logFmtErrPasskeyAuthenticationChallengeValidate, errStrReqBodyParse)
+
+			doMarkAuthenticationAttempt(ctx, false, regulation.NewBan(regulation.BanTypeNone, "", nil), regulation.AuthTypePasskey, nil)
+
 			return
 		}
+		// and unmarshal it using the spnego library
 		var st spnego.SPNEGOToken
 		err = st.Unmarshal(b)
 		if err != nil {
-			SPNEGONegotiateKRB5MechType(SPNEGO, ctx, "%s - spnego.SPNEGO error in unmarshaling spnego.SPNEGO token: %v", ctx.RemoteAddr(), err)
+			ctx.SetStatusCode(fasthttp.StatusBadRequest)
+			ctx.SetJSONError(messageAuthenticationFailed)
+			ctx.Logger.WithError(err).Errorf(logFmtErrPasskeyAuthenticationChallengeValidate, errStrReqBodyParse)
+
+			doMarkAuthenticationAttempt(ctx, false, regulation.NewBan(regulation.BanTypeNone, "", nil), regulation.AuthTypePasskey, nil)
+
+			return
+		}
+
+		SPNEGO, err := ctx.GetSPNEGOProvider()
+		if err != nil {
+			ctx.Logger.WithError(err).Errorf(logFmtErrPasskeyAuthenticationChallengeGenerate, "error occurred provisioning the configuration")
+
+			ctx.SetStatusCode(fasthttp.StatusForbidden)
+			ctx.SetJSONError(messageMFAValidationFailed)
+			doMarkAuthenticationAttempt(ctx, false, regulation.NewBan(regulation.BanTypeNone, "", nil), regulation.AuthTypePasskey, nil)
+
 			return
 		}
 
 		// Validate the context token
 		authed, context, status := SPNEGO.AcceptSecContext(&st)
 		if status.Code != gssapi.StatusComplete && status.Code != gssapi.StatusContinueNeeded {
-			SPNEGOResponseReject(SPNEGO, ctx, "%s - spnego.SPNEGO validation error: %v", ctx.RemoteAddr(), status)
+			ctx.SetStatusCode(fasthttp.StatusForbidden)
+			ctx.SetJSONError(messageMFAValidationFailed)
 			return
 		}
 
 		if status.Code == gssapi.StatusContinueNeeded {
-			SPNEGONegotiateKRB5MechType(SPNEGO, ctx, "%s - spnego.SPNEGO GSS-API continue needed", ctx.RemoteAddr())
+			ctx.SetStatusCode(fasthttp.StatusForbidden)
+			ctx.SetJSONError(messageMFAValidationFailed)
 			return
 		}
 
-		if authed {
-			_ = context.Value(spnego.CTXKeyCredentials).(goidentity.Identity)
+		if !authed {
 
-			ctx.Response.Header.Set(spnego.HTTPHeaderAuthResponse, spnegoNegTokenRespKRBAcceptCompleted)
+			doMarkAuthenticationAttempt(ctx, false, regulation.NewBan(regulation.BanTypeNone, details.Username, nil), regulation.AuthType1FA, nil)
 
+			respondUnauthorized(ctx, messageAuthenticationFailed)
+		}
+
+		authContext := context.Value(spnego.CTXKeyCredentials).(goidentity.Identity)
+		ctx.Response.Header.Set(spnego.HTTPHeaderAuthResponse, spnegoNegTokenRespKRBAcceptCompleted)
+
+		username := authContext.UserName()
+
+		if details, err = ctx.Providers.UserProvider.GetDetails(username); err != nil {
+			ctx.Logger.WithError(err).Errorf("Error occurred getting details for user with username input '%s' which usually indicates they do not exist", username)
+
+			respondUnauthorized(ctx, messageAuthenticationFailed)
+			return
+
+		}
+
+		if ban, _, expires, err := ctx.Providers.Regulator.BanCheck(ctx, details.Username); err != nil {
+			if errors.Is(err, regulation.ErrUserIsBanned) {
+				doMarkAuthenticationAttempt(ctx, false, regulation.NewBan(ban, details.Username, expires), regulation.AuthType1FA, nil)
+
+				respondUnauthorized(ctx, messageAuthenticationFailed)
+
+				return
+			}
+
+			ctx.Logger.WithError(err).Errorf(logFmtErrRegulationFail, regulation.AuthType1FA, details.Username)
+
+			respondUnauthorized(ctx, messageAuthenticationFailed)
+
+			return
+		}
+
+		doMarkAuthenticationAttempt(ctx, true, regulation.NewBan(regulation.BanTypeNone, details.Username, nil), regulation.AuthType1FA, nil)
+
+		var provider *session.Session
+
+		if provider, err = ctx.GetSessionProvider(); err != nil {
+			ctx.Logger.WithError(err).Error("Failed to get session provider during 1FA attempt")
+
+			respondUnauthorized(ctx, messageAuthenticationFailed)
+
+			return
+		}
+
+		if err = provider.DestroySession(ctx.RequestCtx); err != nil {
+			// This failure is not likely to be critical as we ensure to regenerate the session below.
+			ctx.Logger.WithError(err).Trace("Failed to destroy session during 1FA attempt")
+		}
+
+		userSession := provider.NewDefaultUserSession()
+
+		// Reset all values from previous session except OIDC workflow before regenerating the cookie.
+		if err = provider.SaveSession(ctx.RequestCtx, userSession); err != nil {
+			ctx.Logger.WithError(err).Errorf(logFmtErrSessionReset, regulation.AuthType1FA, details.Username)
+
+			respondUnauthorized(ctx, messageAuthenticationFailed)
+
+			return
+		}
+
+		if err = provider.RegenerateSession(ctx.RequestCtx); err != nil {
+			ctx.Logger.WithError(err).Errorf(logFmtErrSessionRegenerate, regulation.AuthType1FA, details.Username)
+
+			respondUnauthorized(ctx, messageAuthenticationFailed)
+
+			return
+		}
+
+		ctx.Logger.Tracef(logFmtTraceProfileDetails, details.Username, details.Groups, details.Emails)
+
+		userSession.SetOneFactorPassword(ctx.Clock.Now(), details, false)
+
+		if ctx.Configuration.AuthenticationBackend.RefreshInterval.Update() {
+			userSession.RefreshTTL = ctx.Clock.Now().Add(ctx.Configuration.AuthenticationBackend.RefreshInterval.Value())
+		}
+		if err = provider.SaveSession(ctx.RequestCtx, userSession); err != nil {
+			ctx.Logger.WithError(err).Errorf(logFmtErrSessionSave, "updated profile", regulation.AuthType1FA, logFmtActionAuthentication, details.Username)
+
+			respondUnauthorized(ctx, messageAuthenticationFailed)
+
+			return
+		}
+
+		if bodyJSON.Workflow == workflowOpenIDConnect {
+			handleOIDCWorkflowResponse(ctx, &userSession, bodyJSON.WorkflowID)
 		} else {
-			SPNEGOResponseReject(SPNEGO, ctx, "%s - spnego.SPNEGO Kerberos authentication failed", ctx.RemoteAddr())
-			return
+			Handle1FAResponse(ctx, bodyJSON.TargetURL, bodyJSON.RequestMethod, userSession.Username, userSession.Groups)
 		}
+
 	}
 }
 
