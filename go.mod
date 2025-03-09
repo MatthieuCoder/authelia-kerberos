@@ -58,6 +58,14 @@ require (
 )
 
 require (
+	github.com/hashicorp/go-uuid v1.0.3 // indirect
+	github.com/jcmturner/gofork v1.7.6 // indirect
+	gopkg.in/jcmturner/aescts.v1 v1.0.1 // indirect
+	gopkg.in/jcmturner/dnsutils.v1 v1.0.1 // indirect
+	gopkg.in/jcmturner/rpc.v1 v1.1.0 // indirect
+)
+
+require (
 	cel.dev/expr v0.19.1 // indirect
 	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/Azure/go-ntlmssp v0.0.0-20221128193559-754e69321358 // indirect
@@ -118,6 +126,8 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20240826202546-f6391c0de4c7 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240826202546-f6391c0de4c7 // indirect
 	google.golang.org/protobuf v1.36.1 // indirect
+	gopkg.in/jcmturner/goidentity.v3 v3.0.0
+	gopkg.in/jcmturner/gokrb5.v7 v7.5.0
 )
 
 exclude github.com/mattn/go-sqlite3 v2.0.3+incompatible
