@@ -14,6 +14,10 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/sirupsen/logrus"
 	"github.com/valyala/fasthttp"
+	"gopkg.in/jcmturner/gokrb5.v7/keytab"
+	"gopkg.in/jcmturner/gokrb5.v7/service"
+	"gopkg.in/jcmturner/gokrb5.v7/spnego"
+	"gopkg.in/jcmturner/gokrb5.v7/types"
 
 	"github.com/authelia/authelia/v4/internal/clock"
 	"github.com/authelia/authelia/v4/internal/configuration/schema"
@@ -670,6 +674,21 @@ func (ctx *AutheliaCtx) GetConfiguration() (config schema.Configuration) {
 // GetProviders returns the providers for this context.
 func (ctx *AutheliaCtx) GetProviders() (providers Providers) {
 	return ctx.Providers
+}
+
+func (ctx *AutheliaCtx) GetSPNEGOProvider() (spnegoService *spnego.SPNEGO, err error) {
+	// todo: load kt in context
+	kt := &keytab.Keytab{}
+
+	host, err := types.GetHostAddress(ctx.RemoteAddr().String())
+
+	if err == nil {
+		spnegoService = spnego.SPNEGOService(kt, service.ClientAddress(host))
+		return
+	} else {
+		spnegoService = spnego.SPNEGOService(kt)
+		return
+	}
 }
 
 func (ctx *AutheliaCtx) GetWebAuthnProvider() (w *webauthn.WebAuthn, err error) {
