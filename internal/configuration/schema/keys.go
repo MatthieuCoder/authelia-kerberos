@@ -406,6 +406,8 @@ var Keys = []string{
 	"session.remember_me",
 	"session.same_site",
 	"session.secret",
+	"spnego.disable",
+	"spnego.keytab",
 	"storage.encryption_key",
 	"storage.local.path",
 	"storage.mysql.address",
